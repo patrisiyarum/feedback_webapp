@@ -1,8 +1,9 @@
 tensorflow-cpu==2.11.0
-tensorflow_text==2.11.0
+tensorflow-text==2.11.0
 tensorflow_hub==0.16.1
-numpy>=1.24.0
-pandas>=2.0.0
-streamlit>=1.28.0
 keras==2.11.0
+streamlit==1.26.0
+pandas==1.5.3
+numpy==1.23.5
 plotly>=5.0.0
+protobuf==3.19.6
