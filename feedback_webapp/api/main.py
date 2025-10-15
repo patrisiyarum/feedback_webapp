@@ -78,20 +78,22 @@ def read_root():
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
-    """Return predicted main and sub-categories with confidence scores."""
     if model is None or not main_category_classes or not subcategory_classes:
-        raise HTTPException(status_code=503, detail="Model unavailable. Check server logs.")
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not available. Please check server logs for more details."
+        )
 
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
     try:
-        # The TFSMLayer behaves like a callable model
-        predictions = model([request.text])
+        # ✅ Correct input format for text model
+        input_data = {"text": tf.constant([request.text])}
+        predictions = model(input_data, training=False)
 
-        # predictions is expected to be a list/tuple of [main_category_preds, sub_category_preds]
-        main_category_preds = predictions[0][0]
-        sub_category_preds = predictions[1][0]
+        main_category_preds = predictions[0][0].numpy()
+        sub_category_preds = predictions[1][0].numpy()
 
         main_pred_index = np.argmax(main_category_preds)
         sub_pred_index = np.argmax(sub_category_preds)
