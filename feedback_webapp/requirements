@@ -1,0 +1,8 @@
+# --- Streamlit Frontend ---
+streamlit==1.50.0
+pandas==2.3.3
+requests==2.32.3
+
+# --- Optional, to avoid source builds ---
+pyarrow==17.0.0 --only-binary=:all:
+protobuf==4.25.3
