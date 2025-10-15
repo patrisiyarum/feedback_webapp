@@ -15,7 +15,7 @@ st.set_page_config(
 # This is the URL where your FastAPI backend is running.
 # When running locally, it's usually http://127.0.0.1:8000
 # When deployed, you'll replace this with your Render URL.
-API_URL = "http://127.0.0.1:8000/predict"
+API_URL = "https://feedback-webapp-5zc2.onrender.com/predict"
 
 # --- Page Title and Description ---
 st.title("FCR Feedback Categorization Tool 📊")
