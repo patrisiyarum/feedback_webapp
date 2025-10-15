@@ -75,7 +75,12 @@ class PredictionResponse(BaseModel):
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Feedback Categorization API is running."}
-
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None
+    }
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
     if model is None or not main_category_classes or not subcategory_classes:
@@ -112,3 +117,4 @@ def predict(request: PredictionRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
