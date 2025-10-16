@@ -81,7 +81,7 @@ def health_check():
         "status": "healthy",
         "model_loaded": model is not None
     }
-@app.post("/predict", response_model=PredictionResponse)
+@app.post("/predict")
 def predict(request: PredictionRequest):
     if model is None or not main_category_classes or not subcategory_classes:
         raise HTTPException(
@@ -100,21 +100,24 @@ def predict(request: PredictionRequest):
         main_category_preds = predictions[0][0].numpy()
         sub_category_preds = predictions[1][0].numpy()
 
-        main_pred_index = np.argmax(main_category_preds)
-        sub_pred_index = np.argmax(sub_category_preds)
+        # Convert to readable format
+        main_results = [
+            {"label": main_category_classes[i], "probability": float(main_category_preds[i]) * 100}
+            for i in range(len(main_category_preds))
+        ]
+        sub_results = [
+            {"label": subcategory_classes[i], "probability": float(sub_category_preds[i]) * 100}
+            for i in range(len(sub_category_preds))
+        ]
 
-        main_confidence = float(main_category_preds[main_pred_index])
-        sub_confidence = float(sub_category_preds[sub_pred_index])
+        # Sort descending by probability
+        main_results.sort(key=lambda x: x["probability"], reverse=True)
+        sub_results.sort(key=lambda x: x["probability"], reverse=True)
 
-        main_category_result = main_category_classes[main_pred_index]
-        sub_category_result = subcategory_classes[sub_pred_index]
-
-        return PredictionResponse(
-            main_category=main_category_result,
-            sub_category=sub_category_result,
-            main_category_confidence=main_confidence,
-            sub_category_confidence=sub_confidence
-        )
+        return {
+            "mainPredictions": main_results,
+            "subPredictions": sub_results
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
