@@ -1,116 +1,140 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import tensorflow as tf
-import tensorflow_text  # Registers the necessary ops for the model.
+import tensorflow_text  # Registers the necessary ops for the model
 import tensorflow_hub as hub
-from keras.layers import TFSMLayer  # ✅ Import added for SavedModel compatibility
+from keras.layers import TFSMLayer
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import json
 import os
 
-# --- 1. Initialize the FastAPI App ---
+# ============================================================
+# 1️⃣ Initialize the FastAPI App
+# ============================================================
 app = FastAPI(
     title="Feedback Categorization API",
     description="An API to classify user feedback into main and sub-categories.",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# --- 2. Add CORS Middleware ---
+# ============================================================
+# 2️⃣ Add CORS Middleware
+# ============================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ⚠️ Change "*" to your frontend URL in production.
+    allow_origins=["*"],  # ⚠️ Replace '*' with your Vercel frontend URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 3. Load Model and Class Files on Startup ---
-MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'two_layer_categorization_model_fixed')
-MAIN_CLASSES_PATH = os.path.join(os.path.dirname(__file__), '..', 'main_category_classes.json')
-SUB_CLASSES_PATH = os.path.join(os.path.dirname(__file__), '..', 'subcategory_classes.json')
+# ============================================================
+# 3️⃣ Define Model + Class Paths
+# ============================================================
+BASE_DIR = os.path.dirname(__file__)
+MODEL_PATH = os.path.join(BASE_DIR, "..", "two_layer_categorization_model_fixed")
+MAIN_CLASSES_PATH = os.path.join(BASE_DIR, "..", "main_category_classes.json")
+SUB_CLASSES_PATH = os.path.join(BASE_DIR, "..", "subcategory_classes.json")
 
 model = None
+input_key = "text"  # Default, will auto-detect
 main_category_classes = []
 subcategory_classes = []
 
+# ============================================================
+# 4️⃣ Load Model + JSON Class Files
+# ============================================================
 @app.on_event("startup")
 def load_model_and_classes():
-    """Load the TensorFlow model and JSON class files once when the API starts."""
-    global model, main_category_classes, subcategory_classes
+    global model, main_category_classes, subcategory_classes, input_key
+
     try:
-        if os.path.exists(MODEL_PATH):
-            # ✅ Use TFSMLayer instead of load_model() for SavedModel directories
-            model = TFSMLayer(
-                MODEL_PATH,
-                call_endpoint="serving_default"  # Change if your endpoint differs
-            )
-            print("✅ TensorFlow model loaded successfully via TFSMLayer.")
-        else:
+        if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"Model directory not found at {MODEL_PATH}")
 
-        with open(MAIN_CLASSES_PATH, 'r') as f:
-            main_category_classes = json.load(f)
+        model = TFSMLayer(MODEL_PATH, call_endpoint="serving_default")
+        print("✅ Model loaded successfully from:", MODEL_PATH)
+        print("🔍 Model signature info:", model.signatures)
+
+        # Detect the correct input key (text vs inputs)
+        sig = model.signatures.get("serving_default")
+        if sig:
+            for key in sig.structured_input_signature[1].keys():
+                input_key = key
+                break
+        print(f"✅ Detected input key: '{input_key}'")
+
+        # Load category label files
+        with open(MAIN_CLASSES_PATH, "r") as f:
+            main_category_classes[:] = json.load(f)
             print(f"✅ Loaded {len(main_category_classes)} main categories.")
 
-        with open(SUB_CLASSES_PATH, 'r') as f:
-            subcategory_classes = json.load(f)
-            print(f"✅ Loaded {len(subcategory_classes)} sub-categories.")
+        with open(SUB_CLASSES_PATH, "r") as f:
+            subcategory_classes[:] = json.load(f)
+            print(f"✅ Loaded {len(subcategory_classes)} subcategories.")
 
     except Exception as e:
-        print("❌ Critical Error: Could not load model or class files. API will not be functional.")
-        print(f"Error details: {e}")
+        print("❌ Error during model/class load:", e)
 
-# --- 4. Define API Schemas ---
+# ============================================================
+# 5️⃣ API Schemas
+# ============================================================
 class PredictionRequest(BaseModel):
     text: str
 
-class PredictionResponse(BaseModel):
-    main_category: str
-    sub_category: str
-    main_category_confidence: float
-    sub_category_confidence: float
-
-# --- 5. Endpoints ---
-@app.get("/")
-def read_root():
-    return {"status": "ok", "message": "Feedback Categorization API is running."}
+# ============================================================
+# 6️⃣ Health Check Endpoint
+# ============================================================
 @app.get("/health")
 def health_check():
     return {
-        "status": "healthy",
-        "model_loaded": model is not None
+        "status": "healthy" if model else "unavailable",
+        "model_loaded": model is not None,
+        "input_key": input_key
     }
+
+# ============================================================
+# 7️⃣ Prediction Endpoint
+# ============================================================
 @app.post("/predict")
 def predict(request: PredictionRequest):
     if model is None or not main_category_classes or not subcategory_classes:
-        raise HTTPException(
-            status_code=503,
-            detail="Model is not available. Please check server logs for more details."
-        )
+        raise HTTPException(status_code=503, detail="Model or class data not available.")
 
-    if not request.text or not request.text.strip():
+    if not request.text.strip():
         raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
     try:
-        # ✅ Correct call for TFSMLayer (no dict)
-        predictions = model(text=tf.constant([request.text]))
+        # Build proper TensorFlow input
+        input_tensor = tf.constant([request.text])
+        print(f"🧠 Running model using key '{input_key}'")
 
-        # Extract output tensors
-        main_category_preds = predictions[0][0].numpy()
-        sub_category_preds = predictions[1][0].numpy()
+        # Dynamically call model with correct input key
+        if input_key == "inputs":
+            predictions = model(inputs=input_tensor)
+        else:
+            predictions = model(text=input_tensor)
 
-        # Convert to readable format
+        # Handle possible dict outputs
+        if isinstance(predictions, dict):
+            outputs = list(predictions.values())
+        else:
+            outputs = predictions
+
+        main_preds = outputs[0][0].numpy()
+        sub_preds = outputs[1][0].numpy()
+
+        # Convert to sorted lists of label-prob pairs
         main_results = [
-            {"label": main_category_classes[i], "probability": float(main_category_preds[i]) * 100}
-            for i in range(len(main_category_preds))
+            {"label": main_category_classes[i], "probability": float(main_preds[i]) * 100}
+            for i in range(len(main_preds))
         ]
         sub_results = [
-            {"label": subcategory_classes[i], "probability": float(sub_category_preds[i]) * 100}
-            for i in range(len(sub_category_preds))
+            {"label": subcategory_classes[i], "probability": float(sub_preds[i]) * 100}
+            for i in range(len(sub_preds))
         ]
 
-        # Sort descending by probability
         main_results.sort(key=lambda x: x["probability"], reverse=True)
         sub_results.sort(key=lambda x: x["probability"], reverse=True)
 
@@ -120,4 +144,12 @@ def predict(request: PredictionRequest):
         }
 
     except Exception as e:
+        print("❌ Prediction failed:", e)
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+# ============================================================
+# 8️⃣ Root Endpoint
+# ============================================================
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Feedback Categorization API is running."}
