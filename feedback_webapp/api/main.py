@@ -93,10 +93,10 @@ def predict(request: PredictionRequest):
         raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
     try:
-        # ✅ Correct input format for text model
-        input_data = {"text": tf.constant([request.text])}
-        predictions = model(input_data, training=False)
+        # ✅ Correct call for TFSMLayer (no dict)
+        predictions = model(text=tf.constant([request.text]))
 
+        # Extract output tensors
         main_category_preds = predictions[0][0].numpy()
         sub_category_preds = predictions[1][0].numpy()
 
@@ -115,6 +115,6 @@ def predict(request: PredictionRequest):
             main_category_confidence=main_confidence,
             sub_category_confidence=sub_confidence
         )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
-
