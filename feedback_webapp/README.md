@@ -43,7 +43,6 @@ The training process includes:
 * **Server:** **Uvicorn**
 
 ## Repository Structure
-/ |-- api/ | |-- main.py # The main FastAPI application logic | -- requirements.txt # Python libraries for the API | |-- two_layer_categorization_model_fixed/ # The exported TensorFlow/BERT model | |-- saved_model.pb | |-- variables/ | -- assets/ | |-- main_category_classes.json # List of all possible main categories |-- subcategory_classes.json # List of all possible subcategories |-- runtime.txt # Specifies the Python version for Render |-- trainingForModel.py # The script used to train the model `-- README.md # This file
 
 
 * `api/main.py`: This script starts the FastAPI server. On startup, it loads the TensorFlow model (`two_layer_categorization_model_fixed`) and category class files into memory.
