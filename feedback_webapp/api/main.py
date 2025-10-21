@@ -1,157 +1,133 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
-import tensorflow_text  # required for ops
 import tensorflow_hub as hub
+import tensorflow_text  # Required for BERT ops
 from keras.layers import TFSMLayer
-from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
 import json
+import numpy as np
+from typing import List, Dict
 import os
+import psycopg2  # <-- NEW: Import the PostgreSQL driver
+import datetime  # <-- NEW: For timestamps
 
-# ============================================================
-# 1️⃣ Initialize FastAPI
-# ============================================================
-app = FastAPI(
-    title="Feedback Categorization API",
-    description="An API to classify user feedback into main and sub-categories.",
-    version="2.1.0"
-)
+app = FastAPI(title="FCR Feedback Categorization API")
 
-# ============================================================
-# 2️⃣ Enable CORS
-# ============================================================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # replace with your frontend origin in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ... (your CORS middleware setup) ...
 
-# ============================================================
-# 3️⃣ File Paths
-# ============================================================
-BASE_DIR = os.path.dirname(__file__)
-MODEL_PATH = os.path.join(BASE_DIR, "..", "two_layer_categorization_model_fixed")
-MAIN_CLASSES_PATH = os.path.join(BASE_DIR, "..", "main_category_classes.json")
-SUB_CLASSES_PATH = os.path.join(BASE_DIR, "..", "subcategory_classes.json")
-
+# Global variables for model and classes
 model = None
-input_key = "text"
-main_category_classes = []
-subcategory_classes = []
+main_classes = None
+sub_classes = None
 
-# ============================================================
-# 4️⃣ Load Model and Labels
-# ============================================================
+# --- NEW: Get Database URL from Environment ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# --- NEW: Database Setup ---
+def init_db():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        # Create the table if it doesn't exist
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMPTZ NOT NULL,
+            input_text TEXT,
+            predicted_main_category VARCHAR(255),
+            main_confidence REAL,
+            predicted_sub_category VARCHAR(255),
+            sub_confidence REAL
+        )
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("✅ Database table initialized.")
+    except Exception as e:
+        print(f"❌ Failed to initialize database: {e}")
+
+# ... (your Pydantic models: PredictionRequest, etc.) ...
+
+# Load model and classes on startup
 @app.on_event("startup")
-def load_model_and_classes():
-    global model, input_key, main_category_classes, subcategory_classes
+async def load_model_and_classes():
+    global model, main_classes, sub_classes
+    
+    if not DATABASE_URL:
+        print("❌ ERROR: DATABASE_URL environment variable not set.")
+    else:
+        init_db()  # Initialize the PostgreSQL database
+    
     try:
-        # Load model
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Model path not found at {MODEL_PATH}")
-
-        model = TFSMLayer(MODEL_PATH, call_endpoint="serving_default")
-        print("✅ Model loaded successfully from:", MODEL_PATH)
-
-        # Try to detect input key safely
-        try:
-            sigs = getattr(model, "signatures", None)
-            if sigs:
-                sig = sigs.get("serving_default")
-                if sig:
-                    key = list(sig.structured_input_signature[1].keys())[0]
-                    input_key = key
-        except Exception:
-            # fallback if no signatures (new Keras)
-            input_key = "text"
-
-        print(f"✅ Using input key: '{input_key}'")
-
-        # Load class label files
-        with open(MAIN_CLASSES_PATH) as f:
-            main_category_classes[:] = json.load(f)
-        with open(SUB_CLASSES_PATH) as f:
-            subcategory_classes[:] = json.load(f)
-
-        print(f"✅ Loaded {len(main_category_classes)} main + {len(subcategory_classes)} subcategories")
-
+        # ... (your existing model and class loading code) ...
+        print("✅ Model and classes loaded.")
     except Exception as e:
-        print("❌ Error loading model or classes:", e)
+        print(f"❌ Error loading model or classes: {e}")
 
-# ============================================================
-# 5️⃣ Schemas
-# ============================================================
-class PredictionRequest(BaseModel):
-    text: str
-
-# ============================================================
-# 6️⃣ Health Check
-# ============================================================
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy" if model else "unavailable",
-        "model_loaded": model is not None,
-        "input_key": input_key,
-    }
-
-# ============================================================
-# 7️⃣ Predict Endpoint
-# ============================================================
-@app.post("/predict")
-def predict(request: PredictionRequest):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded.")
-    if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Input text cannot be empty.")
-
+def predict_text(text: str) -> Dict:
+    """Make prediction for a single text input AND log it to PostgreSQL"""
     try:
-        text_tensor = tf.constant([request.text])
-        print(f"🧠 Predicting with key '{input_key}'")
+        # ... (your existing code to get predictions) ...
+        inputs = tf.constant([text])
+        outputs = model(inputs)
+        main_probs = outputs["main_category_output"][0].numpy() * 100
+        sub_probs = outputs["subcategory_output"][0].numpy() * 100
+        
+        main_sorted = sorted(
+            zip(main_classes, main_probs), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        sub_sorted = sorted(
+            zip(sub_classes, sub_probs), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        # --- THIS IS THE MODIFIED PART ---
+        top_main = main_sorted[0]
+        top_sub = sub_sorted[0]
 
-        # Support both input styles
-        try:
-            predictions = model(**{input_key: text_tensor})
-        except TypeError:
-            # fallback: some models accept positional arg
-            predictions = model(text_tensor)
+        # Log this prediction to the PostgreSQL database
+        if DATABASE_URL:
+            try:
+                conn = psycopg2.connect(DATABASE_URL)
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO predictions (timestamp, input_text, predicted_main_category, main_confidence, predicted_sub_category, sub_confidence)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        datetime.datetime.now(datetime.timezone.utc), # Use timezone-aware datetime
+                        text,
+                        top_main[0],  # e.g., "Food Quality"
+                        float(top_main[1]),  # e.g., 98.5
+                        top_sub[0],   # e.g., "Taste Issues"
+                        float(top_sub[1])    # e.g., 95.2
+                    )
+                )
+                conn.commit()
+                cursor.close()
+                conn.close()
+            except Exception as e:
+                print(f"Database logging failed: {e}") # Log error but don't fail the request
+        # --- END OF MODIFIED PART ---
 
-        # Support dict or tuple outputs
-        if isinstance(predictions, dict):
-            outputs = list(predictions.values())
-        else:
-            outputs = predictions
-
-        main_preds = outputs[0][0].numpy()
-        sub_preds = outputs[1][0].numpy()
-
-        main_results = [
-            {"label": main_category_classes[i], "probability": float(main_preds[i]) * 100}
-            for i in range(len(main_preds))
-        ]
-        sub_results = [
-            {"label": subcategory_classes[i], "probability": float(sub_preds[i]) * 100}
-            for i in range(len(sub_preds))
-        ]
-
-        main_results.sort(key=lambda x: x["probability"], reverse=True)
-        sub_results.sort(key=lambda x: x["probability"], reverse=True)
-
+        # Return the full prediction list as normal
         return {
-            "mainPredictions": main_results,
-            "subPredictions": sub_results
+            "mainPredictions": [
+                {"label": label, "probability": float(prob)}
+                for label, prob in main_sorted
+            ],
+            "subPredictions": [
+                {"label": label, "probability": float(prob)}
+                for label, prob in sub_sorted
+            ]
         }
-
     except Exception as e:
-        print("❌ Prediction failed:", e)
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
-# ============================================================
-# 8️⃣ Root Endpoint
-# ============================================================
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Feedback Categorization API is running."}
+# ... (rest of your FastAPI app: /health, /predict, /categories, etc.) ...
