@@ -92,10 +92,10 @@ async def load_model_and_classes():
     
     try:
         # Adjust these paths based on where your files are located
-        model_path = os.getenv("MODEL_PATH", "two_layer_categorization_model_fixed")
-        main_classes_path = os.getenv("MAIN_CLASSES_PATH", "main_category_classes.json")
-        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
-        
+        # Go one level UP (../) to find the files in the root directory
+        model_path = os.getenv("MODEL_PATH", "../two_layer_categorization_model_fixed")
+        main_classes_path = os.getenv("MAIN_CLASSES_PATH", "../main_category_classes.json")
+        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "../subcategory_classes.json")
         # Load model
         model = TFSMLayer(model_path, call_endpoint="serving_default")
         print(f"✅ Model loaded successfully from {model_path}")
@@ -262,3 +262,4 @@ if __name__ == "__main__":
     print("--- Starting Uvicorn server for local development ---")
     print(f"--- DATABASE_URL set: {DATABASE_URL is not None} ---")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
