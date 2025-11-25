@@ -15,14 +15,14 @@ import os
 import psycopg2
 import datetime
 import re
-import requests  # Required for downloading the model
+import gdown  # Required for downloading the model from Drive
 
 app = FastAPI(title="FCR Feedback Categorization API")
 
-# Configure CORS
+# --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins for now (adjust for production)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +35,7 @@ sub_classes = None
 # --- Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- Constants & Preprocessing Logic ---
+# --- Constants & Preprocessing Logic (Must Match Training Code) ---
 BEVERAGE_WORDS = ["water", "beverage", "drink", "juice", "soda", "coffee", "tea", "bottle", "bottles"]
 SERVICE_ITEM_WORDS = [
     "utensil", "fork", "knife", "spoon", "napkin",
@@ -53,6 +53,7 @@ CREW_WORDS = [
 ]
 
 def clean_text(t: str) -> str:
+    """Cleans text to match training data distribution."""
     t = str(t)
     t = t.replace('\r', ' ').replace('\n', ' ')
     t = re.sub(r'other/comments:\s*', ' ', t, flags=re.IGNORECASE)
@@ -62,6 +63,7 @@ def clean_text(t: str) -> str:
     return t
 
 def keyword_features_from_text(t: str) -> List[float]:
+    """Extracts the 4 keyword features required by the model."""
     t = t.lower()
     has_beverage = int(any(w in t for w in BEVERAGE_WORDS))
     has_service_item = int(any(w in t for w in SERVICE_ITEM_WORDS))
@@ -69,37 +71,33 @@ def keyword_features_from_text(t: str) -> List[float]:
     has_crew = int(any(w in t for w in CREW_WORDS))
     return [float(has_beverage), float(has_service_item), float(has_catering), float(has_crew)]
 
-# --- Google Drive Download Logic ---
-def download_file_from_google_drive(id, destination):
-    URL = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    response = session.get(URL, params={'id': id}, stream=True)
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            token = value
-            break
-    if token:
-        params = {'id': id, 'confirm': token}
-        response = session.get(URL, params=params, stream=True)
-    
-    save_response_content(response, destination)
-
-def save_response_content(response, destination):
-    CHUNK_SIZE = 32768
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
+# --- Model Download Logic ---
+def download_model_if_missing(model_path):
+    """Downloads model from Google Drive if not found locally."""
+    if not os.path.exists(model_path):
+        print(f"⚠️ Model file not found at {model_path}. Downloading from Drive...")
+        
+        # FILE ID from your specific Google Drive link
+        file_id = "1cw0XieJsrexcv3aPnjQDRccpoXdvhiCj"
+        url = f'https://drive.google.com/uc?id={file_id}'
+        
+        try:
+            # gdown handles large files and virus warnings automatically
+            gdown.download(url, model_path, quiet=False)
+            print("✅ Download complete.")
+        except Exception as e:
+            print(f"❌ Failed to download model: {e}")
 
 # --- Database Setup ---
 def init_db():
     if not DATABASE_URL:
         print("❌ DATABASE_URL not set. Logging disabled.")
         return
+
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
+        # Create table if it doesn't exist
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id SERIAL PRIMARY KEY,
@@ -144,20 +142,11 @@ async def load_model_and_classes():
     
     # 1. Download Model if Missing
     model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
+    download_model_if_missing(model_path)
     
-    if not os.path.exists(model_path):
-        print(f"⚠️ Model file not found at {model_path}. Downloading from Drive...")
-        # YOUR FILE ID IS INSERTED HERE:
-        FILE_ID = "1cw0XieJsrexcv3aPnjQDRccpoXdvhiCj" 
-        try:
-            download_file_from_google_drive(FILE_ID, model_path)
-            print("✅ Download complete.")
-        except Exception as e:
-            print(f"❌ Failed to download model: {e}")
-
     try:
         # 2. Load Model
-        # We must map 'KerasLayer' to the hub.KerasLayer class
+        # We must map 'KerasLayer' to the hub.KerasLayer class for loading
         model = tf.keras.models.load_model(
             model_path,
             custom_objects={'KerasLayer': hub.KerasLayer}
@@ -171,7 +160,10 @@ async def load_model_and_classes():
         print(f"✅ Loaded {len(sub_classes)} subcategories")
         
     except Exception as e:
-        print(f"❌ Error loading model/classes: {e}")
+        print(f"❌ Error loading model or classes: {e}")
+        # Debugging: Print file size if it exists to check for corruption
+        if os.path.exists(model_path):
+            print(f"DEBUG: File size of {model_path} is {os.path.getsize(model_path)} bytes")
         model = None
         sub_classes = []
 
@@ -181,23 +173,28 @@ def predict_text(text_input: str) -> Dict:
         raise HTTPException(status_code=503, detail="Model is not loaded")
 
     try:
+        # 1. Preprocess
         cleaned_text = clean_text(text_input)
         kw_feats = keyword_features_from_text(cleaned_text)
         
+        # 2. Prepare Inputs (Batch dim added)
         input_text_tensor = np.array([cleaned_text])
         input_kw_tensor = np.array([kw_feats])
         
+        # 3. Predict (Dual Input)
         predictions = model.predict([input_text_tensor, input_kw_tensor], verbose=0)
-        probs = predictions[0] * 100 
         
+        # 4. Format Results
+        probs = predictions[0] * 100 
         sub_predictions = []
         for i, prob in enumerate(probs):
             if i < len(sub_classes):
                 sub_predictions.append({"label": sub_classes[i], "probability": float(prob)})
         
+        # Sort descending
         sub_sorted = sorted(sub_predictions, key=lambda x: x['probability'], reverse=True)
         
-        # Log to DB
+        # 5. Database Logging
         if DATABASE_URL:
             try:
                 top_sub = sub_sorted[0]
@@ -215,7 +212,7 @@ def predict_text(text_input: str) -> Dict:
                     (
                         datetime.datetime.now(datetime.timezone.utc),
                         text_input,
-                        "N/A",
+                        "N/A",      # Main category placeholder
                         0.0,
                         top_sub["label"],
                         top_sub["probability"]
@@ -234,9 +231,10 @@ def predict_text(text_input: str) -> Dict:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
 # --- Endpoints ---
+
 @app.get("/")
 async def root():
-    return {"status": "online", "model": "Subcategory Classification Augmented"}
+    return {"status": "online", "model": "Subcategory Classification Augmented (8 Labels)"}
 
 @app.get("/health")
 async def health():
@@ -265,6 +263,7 @@ async def predict_bulk(request: BulkPredictionRequest):
     results = []
     for t in request.texts:
         if not t or not t.strip():
+            # Return empty prediction for empty string
             results.append({"subPredictions": []})
         else:
             try:
@@ -276,4 +275,5 @@ async def predict_bulk(request: BulkPredictionRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    # Local debugging
     uvicorn.run(app, host="0.0.0.0", port=8000)
