@@ -10,11 +10,12 @@ import tensorflow_hub as hub
 import tensorflow_text as text  # Required for BERT ops
 import json
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict
 import os
 import psycopg2
 import datetime
 import re
+import requests  # Required for downloading the model
 
 app = FastAPI(title="FCR Feedback Categorization API")
 
@@ -34,7 +35,7 @@ sub_classes = None
 # --- Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- Constants & Preprocessing Logic (Must Match Training Code) ---
+# --- Constants & Preprocessing Logic ---
 BEVERAGE_WORDS = ["water", "beverage", "drink", "juice", "soda", "coffee", "tea", "bottle", "bottles"]
 SERVICE_ITEM_WORDS = [
     "utensil", "fork", "knife", "spoon", "napkin",
@@ -61,7 +62,6 @@ def clean_text(t: str) -> str:
     return t
 
 def keyword_features_from_text(t: str) -> List[float]:
-    """Extracts the 4 keyword features required by the model."""
     t = t.lower()
     has_beverage = int(any(w in t for w in BEVERAGE_WORDS))
     has_service_item = int(any(w in t for w in SERVICE_ITEM_WORDS))
@@ -69,17 +69,37 @@ def keyword_features_from_text(t: str) -> List[float]:
     has_crew = int(any(w in t for w in CREW_WORDS))
     return [float(has_beverage), float(has_service_item), float(has_catering), float(has_crew)]
 
+# --- Google Drive Download Logic ---
+def download_file_from_google_drive(id, destination):
+    URL = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+    response = session.get(URL, params={'id': id}, stream=True)
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            token = value
+            break
+    if token:
+        params = {'id': id, 'confirm': token}
+        response = session.get(URL, params=params, stream=True)
+    
+    save_response_content(response, destination)
+
+def save_response_content(response, destination):
+    CHUNK_SIZE = 32768
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
 # --- Database Setup ---
 def init_db():
     if not DATABASE_URL:
         print("❌ DATABASE_URL not set. Logging disabled.")
         return
-
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        # Table schema updated to allow nullable main_category if needed, 
-        # or we just insert N/A for backward compatibility.
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id SERIAL PRIMARY KEY,
@@ -107,7 +127,6 @@ class PredictionResult(BaseModel):
     probability: float
 
 class PredictionResponse(BaseModel):
-    # Removed mainPredictions since the model no longer supports it
     subPredictions: List[PredictionResult]
 
 class BulkPredictionRequest(BaseModel):
@@ -123,24 +142,32 @@ async def load_model_and_classes():
     
     init_db()
     
+    # 1. Download Model if Missing
+    model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
+    
+    if not os.path.exists(model_path):
+        print(f"⚠️ Model file not found at {model_path}. Downloading from Drive...")
+        # YOUR FILE ID IS INSERTED HERE:
+        FILE_ID = "1cw0XieJsrexcv3aPnjQDRccpoXdvhiCj" 
+        try:
+            download_file_from_google_drive(FILE_ID, model_path)
+            print("✅ Download complete.")
+        except Exception as e:
+            print(f"❌ Failed to download model: {e}")
+
     try:
-        # Paths to your new artifacts
-        # Ensure these files are uploaded/available in the container
-        model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
-        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
-        
-        # Load Classes
-        with open(sub_classes_path, 'r') as f:
-            sub_classes = json.load(f)
-            
-        # Load Model (Using Keras load_model for .keras files with Hub layers)
+        # 2. Load Model
         # We must map 'KerasLayer' to the hub.KerasLayer class
         model = tf.keras.models.load_model(
             model_path,
             custom_objects={'KerasLayer': hub.KerasLayer}
         )
-        
         print(f"✅ Model loaded from {model_path}")
+        
+        # 3. Load Classes
+        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
+        with open(sub_classes_path, 'r') as f:
+            sub_classes = json.load(f)
         print(f"✅ Loaded {len(sub_classes)} subcategories")
         
     except Exception as e:
@@ -154,33 +181,23 @@ def predict_text(text_input: str) -> Dict:
         raise HTTPException(status_code=503, detail="Model is not loaded")
 
     try:
-        # 1. Preprocess Text
         cleaned_text = clean_text(text_input)
-        
-        # 2. Extract Keyword Features
         kw_feats = keyword_features_from_text(cleaned_text)
         
-        # 3. Prepare Inputs for Model [text_tensor, kw_tensor]
-        # Shape needs to be (1, ) for text and (1, 4) for kw
         input_text_tensor = np.array([cleaned_text])
         input_kw_tensor = np.array([kw_feats])
         
-        # 4. Inference
         predictions = model.predict([input_text_tensor, input_kw_tensor], verbose=0)
+        probs = predictions[0] * 100 
         
-        # 5. Process Results (Single Output Layer now)
-        probs = predictions[0] * 100 # Convert to percentage
-        
-        # Map indices to labels
         sub_predictions = []
         for i, prob in enumerate(probs):
             if i < len(sub_classes):
                 sub_predictions.append({"label": sub_classes[i], "probability": float(prob)})
         
-        # Sort desc
         sub_sorted = sorted(sub_predictions, key=lambda x: x['probability'], reverse=True)
         
-        # --- Database Logging ---
+        # Log to DB
         if DATABASE_URL:
             try:
                 top_sub = sub_sorted[0]
@@ -198,8 +215,8 @@ def predict_text(text_input: str) -> Dict:
                     (
                         datetime.datetime.now(datetime.timezone.utc),
                         text_input,
-                        "N/A",      # Main category not available in this model
-                        0.0,        # Dummy confidence
+                        "N/A",
+                        0.0,
                         top_sub["label"],
                         top_sub["probability"]
                     )
@@ -210,16 +227,13 @@ def predict_text(text_input: str) -> Dict:
             except Exception as e:
                 print(f"DB Log Error: {e}")
         
-        return {
-            "subPredictions": sub_sorted
-        }
+        return {"subPredictions": sub_sorted}
 
     except Exception as e:
         print(f"Prediction Error: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
 # --- Endpoints ---
-
 @app.get("/")
 async def root():
     return {"status": "online", "model": "Subcategory Classification Augmented"}
@@ -235,9 +249,7 @@ async def health():
 async def get_categories():
     if not sub_classes:
         raise HTTPException(status_code=503, detail="Classes not loaded")
-    return {
-        "subCategories": sub_classes
-    }
+    return {"subCategories": sub_classes}
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
