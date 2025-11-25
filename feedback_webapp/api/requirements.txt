@@ -9,3 +9,5 @@ streamlit>=1.28.0
 keras>=3.0.0
 plotly>=5.0.0
 psycopg2-binary
+requests
+gdown
