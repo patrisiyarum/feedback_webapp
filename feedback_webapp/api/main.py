@@ -1,6 +1,5 @@
 """
-FastAPI Backend for FCR Feedback Categorization Model
-This file should be deployed alongside your React frontend
+FastAPI Backend for FCR Feedback Categorization Model (Subcategory Only)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -8,45 +7,79 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
 import tensorflow_hub as hub
-import tensorflow_text  # Required for BERT ops
-from keras.layers import TFSMLayer
+import tensorflow_text as text  # Required for BERT ops
 import json
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
-import psycopg2  # For PostgreSQL
-import datetime  # For timestamps
+import psycopg2
+import datetime
+import re
 
 app = FastAPI(title="FCR Feedback Categorization API")
 
-# Configure CORS to allow requests from your frontend
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global variables for model and classes
+# --- Global Variables ---
 model = None
-main_classes = None
 sub_classes = None
 
-# Get Database URL from Environment
+# --- Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# --- Constants & Preprocessing Logic (Must Match Training Code) ---
+BEVERAGE_WORDS = ["water", "beverage", "drink", "juice", "soda", "coffee", "tea", "bottle", "bottles"]
+SERVICE_ITEM_WORDS = [
+    "utensil", "fork", "knife", "spoon", "napkin",
+    "slipper", "amenity kit", "amenity bag", "pillow",
+    "blanket", "glass", "tray setup", "tray"
+]
+CATERING_WORDS = [
+    "catering", "kitchen", "boarded", "not boarded",
+    "loaded", "never loaded", "improperly loaded",
+    "missing meals", "no second meal", "not catered"
+]
+CREW_WORDS = [
+    "flight attendant", "attendant", "fa", "cabin crew",
+    "steward", "staff", "crew did not provide", "not offered"
+]
+
+def clean_text(t: str) -> str:
+    t = str(t)
+    t = t.replace('\r', ' ').replace('\n', ' ')
+    t = re.sub(r'other/comments:\s*', ' ', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bY\b', ' ', t)
+    t = re.sub(r'\s+', ' ', t)
+    t = t.strip().lower()
+    return t
+
+def keyword_features_from_text(t: str) -> List[float]:
+    """Extracts the 4 keyword features required by the model."""
+    t = t.lower()
+    has_beverage = int(any(w in t for w in BEVERAGE_WORDS))
+    has_service_item = int(any(w in t for w in SERVICE_ITEM_WORDS))
+    has_catering = int(any(w in t for w in CATERING_WORDS))
+    has_crew = int(any(w in t for w in CREW_WORDS))
+    return [float(has_beverage), float(has_service_item), float(has_catering), float(has_crew)]
 
 # --- Database Setup ---
 def init_db():
-    """Initializes the PostgreSQL database table if it doesn't exist."""
     if not DATABASE_URL:
-        print("❌ ERROR: DATABASE_URL environment variable not set. Database logging will be disabled.")
+        print("❌ DATABASE_URL not set. Logging disabled.")
         return
 
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        # Create the table if it doesn't exist
+        # Table schema updated to allow nullable main_category if needed, 
+        # or we just insert N/A for backward compatibility.
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id SERIAL PRIMARY KEY,
@@ -65,7 +98,7 @@ def init_db():
     except Exception as e:
         print(f"❌ Failed to initialize database: {e}")
 
-# Request/Response models
+# --- Pydantic Models ---
 class PredictionRequest(BaseModel):
     text: str
 
@@ -74,7 +107,7 @@ class PredictionResult(BaseModel):
     probability: float
 
 class PredictionResponse(BaseModel):
-    mainPredictions: List[PredictionResult]
+    # Removed mainPredictions since the model no longer supports it
     subPredictions: List[PredictionResult]
 
 class BulkPredictionRequest(BaseModel):
@@ -83,183 +116,152 @@ class BulkPredictionRequest(BaseModel):
 class BulkPredictionResponse(BaseModel):
     predictions: List[PredictionResponse]
 
-# Load model and classes on startup
+# --- Startup Event ---
 @app.on_event("startup")
 async def load_model_and_classes():
-    global model, main_classes, sub_classes
+    global model, sub_classes
     
-    init_db()  # Initialize the PostgreSQL database
+    init_db()
     
     try:
-        # Adjust these paths based on where your files are located
-        # Go one level UP (../) to find the files in the root directory
-        model_path = os.getenv("MODEL_PATH", "../two_layer_categorization_model_fixed")
-        main_classes_path = os.getenv("MAIN_CLASSES_PATH", "../main_category_classes.json")
-        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "../subcategory_classes.json")
-        # Load model
-        model = TFSMLayer(model_path, call_endpoint="serving_default")
-        print(f"✅ Model loaded successfully from {model_path}")
+        # Paths to your new artifacts
+        # Ensure these files are uploaded/available in the container
+        model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
+        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
         
-        # Load class labels
-        with open(main_classes_path) as f:
-            main_classes = json.load(f)
-        with open(sub_classes_path) as f:
+        # Load Classes
+        with open(sub_classes_path, 'r') as f:
             sub_classes = json.load(f)
-        print(f"✅ Classes loaded: {len(main_classes)} main categories, {len(sub_classes)} subcategories")
+            
+        # Load Model (Using Keras load_model for .keras files with Hub layers)
+        # We must map 'KerasLayer' to the hub.KerasLayer class
+        model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={'KerasLayer': hub.KerasLayer}
+        )
+        
+        print(f"✅ Model loaded from {model_path}")
+        print(f"✅ Loaded {len(sub_classes)} subcategories")
         
     except Exception as e:
-        print(f"❌ Error loading model or classes: {e}")
-        # Note: In a real app, you might want to prevent the app from starting if the model fails
-        # For now, we'll let it run so /health endpoint can report the error
-        model = None 
-        main_classes = []
+        print(f"❌ Error loading model/classes: {e}")
+        model = None
         sub_classes = []
 
-
-def predict_text(text: str) -> Dict:
-    """Make prediction for a single text input AND log it to PostgreSQL"""
+# --- Prediction Logic ---
+def predict_text(text_input: str) -> Dict:
     if not model:
         raise HTTPException(status_code=503, detail="Model is not loaded")
 
     try:
-        # Convert to tensor
-        inputs = tf.constant([text])
+        # 1. Preprocess Text
+        cleaned_text = clean_text(text_input)
         
-        # Get predictions
-        outputs = model(inputs)
+        # 2. Extract Keyword Features
+        kw_feats = keyword_features_from_text(cleaned_text)
         
-        # Extract probabilities
-        main_probs = outputs["main_category_output"][0].numpy() * 100
-        sub_probs = outputs["subcategory_output"][0].numpy() * 100
+        # 3. Prepare Inputs for Model [text_tensor, kw_tensor]
+        # Shape needs to be (1, ) for text and (1, 4) for kw
+        input_text_tensor = np.array([cleaned_text])
+        input_kw_tensor = np.array([kw_feats])
         
-        # Sort predictions by probability
-        main_sorted = sorted(
-            zip(main_classes, main_probs), 
-            key=lambda x: x[1], 
-            reverse=True
-        )
-        sub_sorted = sorted(
-            zip(sub_classes, sub_probs), 
-            key=lambda x: x[1], 
-            reverse=True
-        )
+        # 4. Inference
+        predictions = model.predict([input_text_tensor, input_kw_tensor], verbose=0)
+        
+        # 5. Process Results (Single Output Layer now)
+        probs = predictions[0] * 100 # Convert to percentage
+        
+        # Map indices to labels
+        sub_predictions = []
+        for i, prob in enumerate(probs):
+            if i < len(sub_classes):
+                sub_predictions.append({"label": sub_classes[i], "probability": float(prob)})
+        
+        # Sort desc
+        sub_sorted = sorted(sub_predictions, key=lambda x: x['probability'], reverse=True)
         
         # --- Database Logging ---
         if DATABASE_URL:
             try:
-                top_main = main_sorted[0]
                 top_sub = sub_sorted[0]
-
                 conn = psycopg2.connect(DATABASE_URL)
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    INSERT INTO predictions (timestamp, input_text, predicted_main_category, main_confidence, predicted_sub_category, sub_confidence)
+                    INSERT INTO predictions (
+                        timestamp, input_text, 
+                        predicted_main_category, main_confidence, 
+                        predicted_sub_category, sub_confidence
+                    )
                     VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        datetime.datetime.now(datetime.timezone.utc), # Use timezone-aware datetime
-                        text,
-                        top_main[0],  # e.g., "Food Quality"
-                        float(top_main[1]),  # e.g., 98.5
-                        top_sub[0],   # e.g., "Taste Issues"
-                        float(top_sub[1])    # e.g., 95.2
+                        datetime.datetime.now(datetime.timezone.utc),
+                        text_input,
+                        "N/A",      # Main category not available in this model
+                        0.0,        # Dummy confidence
+                        top_sub["label"],
+                        top_sub["probability"]
                     )
                 )
                 conn.commit()
                 cursor.close()
                 conn.close()
             except Exception as e:
-                print(f"Database logging failed: {e}") # Log error but don't fail the request
-        # --- End of Database Logging ---
-
-        # Return the full prediction list as normal
+                print(f"DB Log Error: {e}")
+        
         return {
-            "mainPredictions": [
-                {"label": label, "probability": float(prob)}
-                for label, prob in main_sorted
-            ],
-            "subPredictions": [
-                {"label": label, "probability": float(prob)}
-                for label, prob in sub_sorted
-            ]
+            "subPredictions": sub_sorted
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+        print(f"Prediction Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+# --- Endpoints ---
 
 @app.get("/")
 async def root():
-    """Health check endpoint"""
-    return {
-        "status": "online",
-        "message": "FCR Feedback Categorization API",
-        "version": "2.2"
-    }
+    return {"status": "online", "model": "Subcategory Classification Augmented"}
 
 @app.get("/health")
 async def health():
-    """Detailed health check"""
     return {
         "status": "healthy" if model else "unhealthy",
-        "model_loaded": model is not None,
-        "main_classes_count": len(main_classes) if main_classes else 0,
         "sub_classes_count": len(sub_classes) if sub_classes else 0
+    }
+
+@app.get("/categories")
+async def get_categories():
+    if not sub_classes:
+        raise HTTPException(status_code=503, detail="Classes not loaded")
+    return {
+        "subCategories": sub_classes
     }
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    """Predict category for a single text input"""
     if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Text input cannot be empty")
-    
+        raise HTTPException(status_code=400, detail="Empty text")
     return predict_text(request.text)
 
 @app.post("/predict/bulk", response_model=BulkPredictionResponse)
 async def predict_bulk(request: BulkPredictionRequest):
-    """Predict categories for multiple text inputs"""
     if not model:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    if not request.texts:
-        raise HTTPException(status_code=400, detail="No texts provided")
+    results = []
+    for t in request.texts:
+        if not t or not t.strip():
+            results.append({"subPredictions": []})
+        else:
+            try:
+                results.append(predict_text(t))
+            except:
+                results.append({"subPredictions": [{"label": "Error", "probability": 0.0}]})
     
-    predictions = []
-    for text in request.texts:
-        try:
-            # Handle empty strings from bulk list
-            if not text or not text.strip():
-                pred = {
-                    "mainPredictions": [{"label": "No Input", "probability": 0.0}],
-                    "subPredictions": [{"label": "No Input", "probability": 0.0}]
-                }
-            else:
-                pred = predict_text(text)
-            
-            predictions.append(pred)
-        except Exception as e:
-            # Return error prediction for failed items
-            predictions.append({
-                "mainPredictions": [{"label": "Error", "probability": 0.0}],
-                "subPredictions": [{"label": f"Processing Error: {e}", "probability": 0.0}]
-            })
-    
-    return {"predictions": predictions}
-
-@app.get("/categories")
-async def get_categories():
-    """Get available category labels"""
-    if not main_classes or not sub_classes:
-        raise HTTPException(status_code=503, detail="Classes not loaded")
-    
-    return {
-        "mainCategories": main_classes,
-        "subCategories": sub_classes
-    }
+    return {"predictions": results}
 
 if __name__ == "__main__":
     import uvicorn
-    # This part is for local debugging. Render uses the `uvicorn` command in your Start Command.
-    print("--- Starting Uvicorn server for local development ---")
-    print(f"--- DATABASE_URL set: {DATABASE_URL is not None} ---")
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
