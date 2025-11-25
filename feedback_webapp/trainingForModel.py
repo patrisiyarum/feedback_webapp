@@ -1,3 +1,7 @@
+# Full Model for Subcategory Classification (8 labels)
+# Excel loading, text cleaning, deduplication, TRAIN-ONLY augmentation, keyword features,
+# correct evaluation, top-2/top-3 accuracy, and per-class counts.
+
 import tensorflow as tf
 import tensorflow_hub as hub
 import tensorflow_text as text
@@ -8,10 +12,12 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score, classification_report
+from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import train_test_split
 import os
 import random
+import re  # for regex string cleaning
 
 # --- Set Random Seeds for Reproducibility ---
 SEED = 42
@@ -19,238 +25,351 @@ os.environ['PYTHONHASHSEED'] = str(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
-# For older TensorFlow versions or specific operations, you might also need:
-# tf.compat.v1.set_random_seed(SEED)
 
-
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 # --- Configuration ---
-EPOCHS = 15
+EPOCHS = 20
 BATCH_SIZE = 64
-file_path = '/kaggle/input/dataforwebsite/FCR Comments Includes multiple issue comments - Copy 3(Sheet3) (1).csv'
-# --- Data Loading and Preprocessing ---
-#df = pd.read_csv('/kaggle/input/helloooooo/FCR Comments Includes multiple issue comments - Copy(Sheet3) (10).csv')
+file_path = '/kaggle/input/thisisthelastonetoday/balanced_100_each_plus50_per_class.csv'
+
+# ==========================================
+# --- DATA LOADING & BASIC CLEANING ---
+# ==========================================
+print("--- Loading Data ---")
+
 try:
-    # Attempt to read with 'latin1' encoding
-    df = pd.read_csv(file_path, encoding='latin1')
-    print("Successfully read the CSV with 'latin1' encoding.")
+    df = pd.read_csv(file_path)
+    print("Successfully read Excel file.")
+except Exception as e:
+    raise ValueError(f"Could not read Excel file. Error: {e}")
 
-except UnicodeDecodeError:
-    print("Failed to read with 'latin1' encoding. Trying 'cp1252'...")
-    try:
-        # Attempt to read with 'cp1252' encoding
-        df = pd.read_csv(file_path, encoding='cp1252')
-        print("Successfully read the CSV with 'cp1252' encoding.")
-    except UnicodeDecodeError:
-        print("Failed to read with 'cp1252' encoding. The file might be corrupted or encoded differently.")
-    except FileNotFoundError:
-        print(f"Error: The file '{file_path}' was not found. Please ensure the file name and path are correct.")
-except FileNotFoundError:
-    print(f"Error: The file '{file_path}' was not found. Please ensure the file name and path are correct.")
-
-
-
-
-
-
-
-
-df.dropna(subset=['text', 'subcategory', 'label'], inplace=True)
-df['label'] = df['label'].astype(str).apply(lambda x: x.title())
-df['subcategory'] = df['subcategory'].astype(str).apply(lambda x: x.title())
-for col_name in ['label', 'subcategory']:
-    df[col_name] = df[col_name].astype(str).str.strip().str.replace(r'[\n\r\s]+', ' ', regex=True).str.strip()
-
-
-# Initialize separate LabelBinarizers for main categories and subcategories
-main_label_binarizer = sklearn.preprocessing.LabelBinarizer()
-sub_label_binarizer = sklearn.preprocessing.LabelBinarizer()
-
-# Apply binarization for 'label' (main categories)
-main_label_binarizer.fit(df['label'])
-df['main_category_int_label'] = main_label_binarizer.transform(df['label']).argmax(axis=1)
-df.drop('label', axis='columns', inplace=True)
-
-# Apply binarization for 'subcategory'
-sub_label_binarizer.fit(df['subcategory'])
-df['subcategory_int_label'] = sub_label_binarizer.transform(df['subcategory']).argmax(axis=1)
-df.drop('subcategory', axis='columns', inplace=True)
-
-print("DataFrame head after preprocessing (showing integer labels):")
-print(df.head())
-print("\nMain Categories (main_label_binarizer.classes_):")
-print(main_label_binarizer.classes_)
-print("\nSubcategories (sub_label_binarizer.classes_):")
-print(sub_label_binarizer.classes_)
-
-# Split the dataset into training and validation sets
-val_df = df.sample(frac=0.2, random_state=SEED)
-train_df = df.drop(val_df.index)
-
-print(f'\nTraining Dataset Size: {len(train_df)}', f'Validation Dataset Size: {len(val_df)}', sep='\n')
-
-# --- Calculate Class Weights ---
-print("\nCalculating Class Weights...")
-
-train_main_labels_int = train_df['main_category_int_label'].values
-train_sub_labels_int = train_df['subcategory_int_label'].values
-
-NUM_MAIN_CLASSES = len(main_label_binarizer.classes_)
-NUM_SUB_CLASSES = len(sub_label_binarizer.classes_)
-
-main_class_weights_array = compute_class_weight(
-    class_weight='balanced',
-    classes=np.arange(NUM_MAIN_CLASSES),
-    y=train_main_labels_int
+# Clean column headers
+print(f"Original Columns: {df.columns.tolist()}")
+df.columns = (
+    df.columns.astype(str)
+      .str.replace(r'[^\w\s]', '', regex=True)
+      .str.strip()
+      .str.lower()
 )
-main_class_weight_dict = dict(zip(np.arange(NUM_MAIN_CLASSES), main_class_weights_array))
+print(f"Cleaned Columns:  {df.columns.tolist()}")
 
-print("Main Category Class Weights (by index):", main_class_weight_dict)
+# Standardize names: text / subcategory
+if 'text' not in df.columns:
+    if len(df.columns) >= 1:
+        print(f"Mapping column 0 ('{df.columns[0]}') to 'text'")
+        df.rename(columns={df.columns[0]: 'text'}, inplace=True)
 
-sub_class_weights_array = compute_class_weight(
-    class_weight='balanced',
-    classes=np.arange(NUM_SUB_CLASSES),
-    y=train_sub_labels_int
+if 'subcategory' not in df.columns:
+    found = False
+    for col in df.columns:
+        if 'cat' in col or 'label' in col:
+            print(f"Mapping column '{col}' to 'subcategory'")
+            df.rename(columns={col: 'subcategory'}, inplace=True)
+            found = True
+            break
+    if not found and len(df.columns) >= 2:
+        print(f"Mapping column 1 ('{df.columns[1]}') to 'subcategory'")
+        df.rename(columns={df.columns[1]: 'subcategory'}, inplace=True)
+
+print(f"Final Columns:    {df.columns.tolist()}")
+if 'text' not in df.columns or 'subcategory' not in df.columns:
+    raise KeyError(
+        "Could not identify 'text' and 'subcategory' columns even after cleaning."
+    )
+
+df.dropna(subset=['text', 'subcategory'], inplace=True)
+
+# Text cleaning
+def clean_text(t: str) -> str:
+    t = str(t)
+    t = t.replace('\r', ' ').replace('\n', ' ')
+    t = re.sub(r'other/comments:\s*', ' ', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bY\b', ' ', t)
+    t = re.sub(r'\s+', ' ', t)
+    t = t.strip().lower()
+    return t
+
+df['subcategory'] = df['subcategory'].astype(str).apply(lambda x: x.strip().title())
+df['text'] = df['text'].astype(str).apply(clean_text)
+
+# ==========================================
+# --- DEDUPLICATION & CONFLICT REMOVAL ---
+# ==========================================
+print("\n--- Deduplication & Conflict Handling ---")
+
+before = len(df)
+df.drop_duplicates(subset=['text', 'subcategory'], inplace=True)
+after = len(df)
+print(f"Dropped {before - after} exact duplicate rows.")
+
+conflict_counts = df.groupby('text')['subcategory'].nunique()
+conflict_texts = conflict_counts[conflict_counts > 1].index
+num_conflicts = len(conflict_texts)
+print(f"Found {num_conflicts} texts with conflicting labels.")
+if num_conflicts > 0:
+    df = df[~df['text'].isin(conflict_texts)]
+    print(f"Dropped {num_conflicts} conflicting text groups. New size: {len(df)}")
+
+df = df.reset_index(drop=True)
+
+# ==========================================
+# --- LABEL ENCODING ---
+# ==========================================
+print("\nEncoding Labels...")
+label_encoder = sklearn.preprocessing.LabelEncoder()
+df['int_label'] = label_encoder.fit_transform(df['subcategory'])
+NUM_CLASSES = len(label_encoder.classes_)
+
+print(f"Total Unique Subcategories: {NUM_CLASSES}")
+print(label_encoder.classes_)
+
+# ==========================================
+# --- STRATIFIED TRAIN/VAL SPLIT ---
+# ==========================================
+train_df, val_df = train_test_split(
+    df,
+    test_size=0.2,
+    random_state=SEED,
+    stratify=df['int_label']
 )
-sub_class_weight_dict = dict(zip(np.arange(NUM_SUB_CLASSES), sub_class_weights_array))
+train_df = train_df.copy()
+val_df = val_df.copy()
 
-print("Subcategory Class Weights (by index):", sub_class_weight_dict)
+print(f"\nTraining Size (before aug): {len(train_df)}")
+print(f"Validation Size:            {len(val_df)}")
 
-# --- Sanity Check on Integer Labels ---
-print("\n--- Sanity Check on Integer Labels ---")
-print("Unique main_category_int_label in train_df:", np.unique(train_df['main_category_int_label']))
-print("Min main_category_int_label:", np.min(train_df['main_category_int_label']))
-print("Max main_category_int_label:", np.max(train_df['main_category_int_label']))
-print("Number of main classes defined by binarizer:", NUM_MAIN_CLASSES)
+# Per-class counts BEFORE augmentation
+orig_train_counts = train_df['int_label'].value_counts().sort_index()
 
-print("\nUnique subcategory_int_label in train_df:", np.unique(train_df['subcategory_int_label']))
-print("Min subcategory_int_label:", np.min(train_df['subcategory_int_label']))
-print("Max subcategory_int_label:", np.max(train_df['subcategory_int_label']))
-print("Number of sub classes defined by binarizer:", NUM_SUB_CLASSES)
-print("--------------------------------------")
+# Save original labels for class weights
+base_train_labels = train_df['int_label'].values
 
+# ==========================================
+# --- SYNONYM-BASED AUGMENTATION (TRAIN ONLY) ---
+# ==========================================
+print("\n--- Augmenting Training Data ---")
 
-# --- Add Sample Weights to DataFrame ---
-# Map integer labels to their computed weights
-train_df['main_sample_weight'] = train_df['main_category_int_label'].map(main_class_weight_dict)
-train_df['sub_sample_weight'] = train_df['subcategory_int_label'].map(sub_class_weight_dict)
+SYNONYM_RULES = [
+    (r'\bpassengers\b', ['customers', 'pax', 'guests']),
+    (r'\bpassenger\b', ['customer', 'pax', 'guest']),
+    (r'\bflight attendants\b', ['fas', 'cabin crew', 'flight crew']),
+    (r'\bflight attendant\b', ['fa', 'cabin crew member']),
+    (r'\bcrew meals\b', ['staff meals', 'pilot meals']),
+    (r'\bmeal\b', ['dish', 'entree']),
+    (r'\bmeals\b', ['dishes', 'entrees']),
+    (r'\bbeverages\b', ['drinks', 'refreshments']),
+    (r'\bbeverage\b', ['drink', 'refreshment']),
+    (r'\bwater bottles\b', ['bottled water', 'small waters']),
+    (r'\bwater bottle\b', ['bottled water', 'small water']),
+    (r'\bamenity kits\b', ['amenity bags', 'travel kits']),
+    (r'\bamenity kit\b', ['amenity bag', 'travel kit']),
+    (r'\bslippers\b', ['house shoes', 'cabin slippers']),
+    (r'\bcatering\b', ['kitchen', 'food service']),
+    (r'\bnot boarded\b', ['never loaded', 'missing from load']),
+    (r'\bmissing\b', ['not available', 'unavailable', 'short']),
+    (r'\binsufficient\b', ['not enough', 'shortage of']),
+]
 
-# --- Helper Function to Convert DataFrame to TensorFlow Dataset (MODIFIED for Sample Weights) ---
-def dataframe_to_tf_dataset(dataframe, include_sample_weights=False):
+def augment_text_once(text: str) -> str:
+    """Apply random synonym substitutions to create one variant."""
+    new_text = text
+    for pattern, replacements in SYNONYM_RULES:
+        if random.random() < 0.4 and re.search(pattern, new_text):
+            new_text = re.sub(pattern, random.choice(replacements), new_text)
+    return new_text
+
+def augment_row(row, n_aug=2):
+    """Generate up to n_aug augmented versions of a row's text."""
+    original = row['text']
+    variants = set()
+    for _ in range(n_aug):
+        t = augment_text_once(original)
+        if t != original:
+            variants.add(t)
+    return list(variants)
+
+aug_rows = []
+for _, row in train_df.iterrows():
+    new_texts = augment_row(row, n_aug=3)
+    for t in new_texts:
+        new_row = row.copy()
+        new_row['text'] = t
+        aug_rows.append(new_row)
+
+aug_df = pd.DataFrame(aug_rows)
+print(f"Generated {len(aug_df)} augmented rows.")
+
+# Per-class AUGMENTED counts
+aug_counts = aug_df['int_label'].value_counts().sort_index()
+
+# Combine original + augmented training data
+train_df = pd.concat([train_df, aug_df], ignore_index=True)
+train_df = train_df.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
+
+print(f"Training Size (after aug):  {len(train_df)}")
+
+# Per-class TOTAL counts after augmentation
+final_train_counts = train_df['int_label'].value_counts().sort_index()
+
+print("\nPer-class training counts (orig / aug / total):")
+for i, label in enumerate(label_encoder.classes_):
+    orig = int(orig_train_counts.get(i, 0))
+    aug = int(aug_counts.get(i, 0))
+    total = int(final_train_counts.get(i, 0))
+    print(f"{i} - {label}: orig={orig}, aug={aug}, total={total}")
+
+# ==========================================
+# --- KEYWORD FEATURES (AFTER AUGMENTATION) ---
+# ==========================================
+print("\n--- Building Keyword Features ---")
+
+BEVERAGE_WORDS = ["water", "beverage", "drink", "juice", "soda", "coffee", "tea", "bottle", "bottles"]
+SERVICE_ITEM_WORDS = [
+    "utensil", "fork", "knife", "spoon", "napkin",
+    "slipper", "amenity kit", "amenity bag", "pillow",
+    "blanket", "glass", "tray setup", "tray"
+]
+CATERING_WORDS = [
+    "catering", "kitchen", "boarded", "not boarded",
+    "loaded", "never loaded", "improperly loaded",
+    "missing meals", "no second meal", "not catered"
+]
+CREW_WORDS = [
+    "flight attendant", "attendant", "fa", "cabin crew",
+    "steward", "staff", "crew did not provide", "not offered"
+]
+
+def keyword_features_from_text(t: str) -> dict:
+    t = t.lower()
+    has_beverage = int(any(w in t for w in BEVERAGE_WORDS))
+    has_service_item = int(any(w in t for w in SERVICE_ITEM_WORDS))
+    has_catering = int(any(w in t for w in CATERING_WORDS))
+    has_crew = int(any(w in t for w in CREW_WORDS))
+    return {
+        "kw_beverage": has_beverage,
+        "kw_service_item": has_service_item,
+        "kw_catering": has_catering,
+        "kw_crew": has_crew,
+    }
+
+for subset in (train_df, val_df):
+    kw_df = subset['text'].apply(keyword_features_from_text).apply(pd.Series)
+    for col in kw_df.columns:
+        subset[col] = kw_df[col].astype('float32')
+
+KW_COLS = ["kw_beverage", "kw_service_item", "kw_catering", "kw_crew"]
+print("Keyword feature sample (train):\n", train_df[KW_COLS].head())
+
+# ==========================================
+# --- CLASS WEIGHTS (from ORIGINAL train only) ---
+# ==========================================
+print("\n--- Class Weights ---")
+class_weights_array = compute_class_weight(
+    class_weight='balanced',
+    classes=np.arange(NUM_CLASSES),
+    y=base_train_labels  # ORIGINAL labels before augmentation
+)
+class_weight_dict = dict(zip(np.arange(NUM_CLASSES), class_weights_array))
+print(class_weight_dict)
+
+train_df['sample_weight'] = train_df['int_label'].map(class_weight_dict)
+
+# ==========================================
+# --- TF DATASETS ---
+# ==========================================
+def dataframe_to_tf_dataset(dataframe, include_sample_weights=False, shuffle=True):
     dataframe = dataframe.copy()
-    feature = dataframe.pop('text')
-
-    main_labels = tf.cast(dataframe.pop('main_category_int_label'), tf.int32)
-    sub_labels = tf.cast(dataframe.pop('subcategory_int_label'), tf.int32)
+    text_feat = dataframe.pop('text')
+    labels = tf.cast(dataframe.pop('int_label'), tf.int32)
+    kw_feats = dataframe[KW_COLS].astype('float32').values
 
     if include_sample_weights:
-        main_weights = tf.cast(dataframe.pop('main_sample_weight'), tf.float32)
-        sub_weights = tf.cast(dataframe.pop('sub_sample_weight'), tf.float32)
-        # Yield (features, {labels_dict}, {sample_weights_dict})
-        ds = tf.data.Dataset.from_tensor_slices(
-            (feature,
-             {'main_category_output': main_labels, 'subcategory_output': sub_labels},
-             {'main_category_output': main_weights, 'subcategory_output': sub_weights})
-        )
+        weights = tf.cast(dataframe.pop('sample_weight'), tf.float32)
+        ds = tf.data.Dataset.from_tensor_slices(((text_feat, kw_feats), labels, weights))
     else:
-        # Yield (features, {labels_dict}) for validation set
-        ds = tf.data.Dataset.from_tensor_slices(
-            (feature, {'main_category_output': main_labels, 'subcategory_output': sub_labels})
+        ds = tf.data.Dataset.from_tensor_slices(((text_feat, kw_feats), labels))
+
+    if shuffle:
+        ds = ds.shuffle(
+            buffer_size=len(text_feat),
+            seed=SEED,
+            reshuffle_each_iteration=True
         )
-
-    # Use .map to apply tf.squeeze, ensuring labels are scalar before batching
-    def _map_fn(text, labels_dict, weights_dict=None):
-        processed_labels = {
-            'main_category_output': tf.squeeze(labels_dict['main_category_output']),
-            'subcategory_output': tf.squeeze(labels_dict['subcategory_output'])
-        }
-        if weights_dict is not None:
-            processed_weights = {
-                'main_category_output': tf.squeeze(weights_dict['main_category_output']),
-                'subcategory_output': tf.squeeze(weights_dict['subcategory_output'])
-            }
-            return text, processed_labels, processed_weights
-        return text, processed_labels
-
-    # Apply map based on whether sample weights are included
-    if include_sample_weights:
-        ds = ds.map(lambda text, labels_dict, weights_dict: _map_fn(text, labels_dict, weights_dict), num_parallel_calls=tf.data.AUTOTUNE)
-    else:
-        ds = ds.map(lambda text, labels_dict: _map_fn(text, labels_dict), num_parallel_calls=tf.data.AUTOTUNE)
-
-    ds = ds.shuffle(buffer_size=len(dataframe))
     return ds
 
-# Create TensorFlow Datasets
-# Pass include_sample_weights=True for training dataset
-train_ds = dataframe_to_tf_dataset(train_df, include_sample_weights=True).batch(BATCH_SIZE).cache().prefetch(tf.data.AUTOTUNE)
-# Validation dataset does not need sample weights
-val_ds = dataframe_to_tf_dataset(val_df, include_sample_weights=False).batch(BATCH_SIZE).cache().prefetch(tf.data.AUTOTUNE)
+train_ds = (
+    dataframe_to_tf_dataset(train_df, include_sample_weights=True, shuffle=True)
+      .batch(BATCH_SIZE)
+      .cache()
+      .prefetch(tf.data.AUTOTUNE)
+)
+val_ds = (
+    dataframe_to_tf_dataset(val_df, include_sample_weights=False, shuffle=False)
+      .batch(BATCH_SIZE)
+      .cache()
+      .prefetch(tf.data.AUTOTUNE)
+)
 
+# ==========================================
+# --- MODEL: BERT + KEYWORD FEATURES ---
+# ==========================================
+print("\nBuilding Model...")
 
-# --- Model Architecture ---
 text_input = tf.keras.Input(shape=(), name='text', dtype='string')
+kw_input = tf.keras.Input(shape=(len(KW_COLS),), name='kw_features', dtype='float32')
+
 preprocessor = hub.KerasLayer(
     'https://kaggle.com/models/tensorflow/bert/frameworks/TensorFlow2/variations/en-uncased-preprocess/versions/3',
     name='bert_preprocessor'
 )
 encoder_inputs = preprocessor(text_input)
+
 encoder = hub.KerasLayer(
     'https://www.kaggle.com/models/tensorflow/bert/frameworks/TensorFlow2/variations/bert-en-uncased-l-6-h-128-a-2/versions/2',
     trainable=True,
     name='bert_encoder'
 )
-outputs = encoder(encoder_inputs)
-pooled_output = outputs['pooled_output']
-x = tf.keras.layers.Dropout(0.20, name='dropout')(pooled_output)
 
-main_outputs = tf.keras.layers.Dense(len(main_label_binarizer.classes_), activation='softmax', name='main_category_output')(x)
-sub_outputs = tf.keras.layers.Dense(len(sub_label_binarizer.classes_), activation='softmax', name='subcategory_output')(x)
+encoder_outputs = encoder(encoder_inputs)
+pooled_output = encoder_outputs['pooled_output']
 
-model = tf.keras.models.load_model(
-    "two_layer_categorization_model.keras",
-    custom_objects={"KerasLayer": hub.KerasLayer},
-    compile=False
-)
+concat = tf.keras.layers.Concatenate(name='concat_features')([pooled_output, kw_input])
+x = tf.keras.layers.Dropout(0.20, name='dropout')(concat)
 
-# Re-export using the universal SavedModel format
-model.save("two_layer_categorization_model_fixed", save_format="tf")
+model_output = tf.keras.layers.Dense(
+    NUM_CLASSES,
+    activation='softmax',
+    name='subcategory_output'
+)(x)
+
+model = tf.keras.Model(inputs=[text_input, kw_input], outputs=model_output)
+
+optimizer = tf.keras.optimizers.Adamax(learning_rate=3e-4)
+
 model.compile(
-    optimizer='adamax',
-    loss={'main_category_output': 'sparse_categorical_crossentropy', 'subcategory_output': 'sparse_categorical_crossentropy'},
-    metrics={'main_category_output': ['accuracy'], 'subcategory_output': ['accuracy']}
+    optimizer=optimizer,
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
 )
-print(model.optimizer)
-print("\nModel Summary:")
+
 model.summary()
 
-# --- Custom Callback for Overfitting Detection ---
 class OverfittingEarlyStopping(tf.keras.callbacks.Callback):
     def __init__(self, patience=5, min_delta=0.001, monitor='val_loss'):
-        super(OverfittingEarlyStopping, self).__init__()
+        super().__init__()
         self.patience = patience
         self.min_delta = min_delta
         self.monitor = monitor
         self.best_loss = np.inf
         self.wait = 0
-        self.history = {'loss': [], 'val_loss': []}
 
     def on_epoch_end(self, epoch, logs=None):
-        logs = logs or {}
-        current_loss = logs.get('loss')
         current_val_loss = logs.get(self.monitor)
-
-        if current_loss is None or current_val_loss is None:
-            warnings.warn(f"Monitor '{self.monitor}' or 'loss' not found in logs. "
-                          "Overfitting detection may not work as expected.", RuntimeWarning)
+        if current_val_loss is None:
             return
 
-        self.history['loss'].append(current_loss)
-        self.history['val_loss'].append(current_val_loss)
-
-        print(f"Epoch {epoch+1}: Train Loss: {current_loss:.4f}, Validation Loss: {current_val_loss:.4f}")
+        print(f"Epoch {epoch+1} Val Loss: {current_val_loss:.4f}")
 
         if current_val_loss < self.best_loss - self.min_delta:
             self.best_loss = current_val_loss
@@ -258,191 +377,109 @@ class OverfittingEarlyStopping(tf.keras.callbacks.Callback):
         else:
             self.wait += 1
             if self.wait >= self.patience:
-                print(f"\nOverfitting detected! Validation loss did not improve for {self.patience} epochs.")
+                print(f"Stopping early. No improvement for {self.patience} epochs.")
                 self.model.stop_training = True
 
-
-# --- Model Training (Using Sample Weights from Dataset) ---
-print("\nStarting Model Training...")
-
-overfitting_callback = OverfittingEarlyStopping(patience=5, min_delta=0.001, monitor='val_loss')
-
-# history = model.fit( # TEMPORARILY COMMENTED OUT FOR THIS ATTEMPT
-#     train_ds,
-#     epochs=EPOCHS,
-#     validation_data=val_ds,
-#     callbacks=[overfitting_callback],
-#     class_weight={
-#         'main_category_output': main_class_weight_dict,
-#         'subcategory_output': sub_class_weight_dict
-#     }
-# )
-
-# Use the train_ds which now yields sample weights
+# ==========================================
+# --- TRAINING ---
+# ==========================================
+print("\nStarting Training...")
 history = model.fit(
     train_ds,
     epochs=EPOCHS,
     validation_data=val_ds,
-    callbacks=[overfitting_callback]
-    # No class_weight argument needed here, as weights are part of the dataset
+    callbacks=[OverfittingEarlyStopping(patience=4)]
 )
-print("Model Training Complete.")
 
-# --- Save Model and Binarizer Classes ---
-model.save('two_layer_categorization_model.keras')
+model.save('subcategory_model_augmented.keras')
+with open('subcategory_classes.json', 'w') as f:
+    json.dump(label_encoder.classes_.tolist(), f)
+print("\nModel and classes saved.")
 
-with open('main_category_classes.json', 'w') as file:
-    json.dump(main_label_binarizer.classes_.tolist(), file)
+# ==========================================
+# --- EVALUATION (with Top-2 / Top-3 accuracy) ---
+# ==========================================
+print("\n--- Evaluation ---")
+true_labels = []
+pred_labels = []
+top2_correct = 0
+top3_correct = 0
+total = 0
 
-with open('subcategory_classes.json', 'w') as file:
-    json.dump(sub_label_binarizer.classes_.tolist(), file)
+for (text_batch, kw_batch), label_batch in val_ds:
+    probs = model.predict([text_batch, kw_batch], verbose=0)
+    top1 = np.argmax(probs, axis=1)
+    # indices of 2 and 3 highest probs
+    top2 = np.argsort(probs, axis=1)[:, -2:]
+    top3 = np.argsort(probs, axis=1)[:, -3:]
 
-print("\nModel saved as 'two_layer_categorization_model.keras'.")
-print("Main category classes saved as 'main_category_classes.json'.")
-print("Subcategory classes saved as 'subcategory_classes.json'.")
+    labels_np = label_batch.numpy()
+    for i, true_label in enumerate(labels_np):
+        total += 1
+        true_labels.append(true_label)
+        pred_labels.append(top1[i])
 
-# --- Prediction Function ---
-def predict(text_input_str):
-    feature = tf.constant([text_input_str])
-    main_predictions_raw, sub_predictions_raw = model(feature)
+        if true_label in top2[i]:
+            top2_correct += 1
+        if true_label in top3[i]:
+            top3_correct += 1
 
-    main_predictions_dict = {}
-    for i, cls in enumerate(main_label_binarizer.classes_):
-        main_predictions_dict[cls] = main_predictions_raw[0][i].numpy() * 100
-    main_predictions_dict = {k: float(v) for k, v in sorted(main_predictions_dict.items(), key=lambda item: item[1], reverse=True)}
+true_labels = np.array(true_labels)
+pred_labels = np.array(pred_labels)
 
-    sub_predictions_dict = {}
-    for i, cls in enumerate(sub_label_binarizer.classes_):
-        sub_predictions_dict[cls] = sub_predictions_raw[0][i].numpy() * 100
-    sub_predictions_dict = {k: float(v) for k, v in sorted(sub_predictions_dict.items(), key=lambda item: item[1], reverse=True)}
+top1_accuracy = (pred_labels == true_labels).mean()
+top2_accuracy = top2_correct / total
+top3_accuracy = top3_correct / total
 
-    return {"main_category_predictions": main_predictions_dict, "subcategory_predictions": sub_predictions_dict}
+print(f"\nTop-1 Accuracy: {top1_accuracy:.3f}")
+print(f"Top-2 Accuracy: {top2_accuracy:.3f}")
+print(f"Top-3 Accuracy: {top3_accuracy:.3f}")
 
-# --- Evaluation ---
-print("\n--- Model Evaluation ---")
+unique_labels = np.unique(np.concatenate((true_labels, pred_labels)))
+target_names = [label_encoder.classes_[i] for i in unique_labels]
 
-# --- For Main Category Evaluation ---
-true_main_labels_indices = val_df['main_category_int_label'].values
+print(
+    "\nClassification Report (Top-1 predictions):\n",
+    classification_report(
+        true_labels,
+        pred_labels,
+        labels=unique_labels,
+        target_names=target_names,
+        zero_division=0
+    )
+)
 
-predicted_main_labels_indices = []
-for text_val in val_df['text'].values:
-    preds = predict(text_val)
-    predicted_class_name = max(preds["main_category_predictions"], key=preds["main_category_predictions"].get)
-    predicted_main_labels_indices.append(main_label_binarizer.classes_.tolist().index(predicted_class_name))
-
-predicted_main_labels_indices = np.array(predicted_main_labels_indices)
-
-accuracy_main = accuracy_score(true_main_labels_indices, predicted_main_labels_indices)
-precision_main = precision_score(true_main_labels_indices, predicted_main_labels_indices, average='weighted', zero_division=0)
-recall_main = recall_score(true_main_labels_indices, predicted_main_labels_indices, average='weighted', zero_division=0)
-f1_main = f1_score(true_main_labels_indices, predicted_main_labels_indices, average='weighted', zero_division=0)
-
-print("\n--- Main Category Evaluation ---")
-print(f"Accuracy (Main): {accuracy_main:.4f}")
-print(f"Precision (Main, weighted): {precision_main:.4f}")
-print(f"Recall (Main, weighted): {recall_main:.4f}")
-print(f"F1-score (Main, weighted): {f1_main:.4f}")
-print("\nClassification Report (Main):")
-print(classification_report(true_main_labels_indices, predicted_main_labels_indices, target_names=main_label_binarizer.classes_, zero_division=0))
-
-cm_main = confusion_matrix(true_main_labels_indices, predicted_main_labels_indices, labels=np.arange(len(main_label_binarizer.classes_)))
-
+cm = confusion_matrix(true_labels, pred_labels, labels=unique_labels)
 plt.figure(figsize=(12, 10))
-sns.heatmap(cm_main, annot=True, fmt='d', cmap='Blues',
-            xticklabels=main_label_binarizer.classes_,
-            yticklabels=main_label_binarizer.classes_)
-plt.xlabel('Predicted Main Labels')
-plt.ylabel('True Main Labels')
-plt.title('Confusion Matrix - Main Categories')
-plt.xticks(rotation=45, ha='right')
-plt.yticks(rotation=0)
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=target_names,
+    yticklabels=target_names
+)
+plt.title('Confusion Matrix')
+plt.xticks(rotation=90)
 plt.tight_layout()
 plt.show()
 
+# ==========================================
+# --- SINGLE PREDICTION ---
+# ==========================================
+def keyword_features_for_single(text_str: str) -> np.ndarray:
+    feats = keyword_features_from_text(clean_text(text_str))
+    return np.array([[feats[c] for c in KW_COLS]], dtype='float32')
 
-# --- For Subcategory Evaluation ---
-true_sub_labels_indices = val_df['subcategory_int_label'].values
+def predict_single(text_str: str):
+    clean_str = clean_text(text_str)
+    kw_vec = keyword_features_for_single(clean_str)
+    probs = model.predict([np.array([clean_str]), kw_vec], verbose=0)[0] * 100
+    results = {label_encoder.classes_[i]: float(probs[i]) for i in range(len(probs))}
+    return dict(sorted(results.items(), key=lambda x: x[1], reverse=True))
 
-predicted_sub_labels_indices = []
-for text_val in val_df['text'].values:
-    preds = predict(text_val)
-    predicted_class_name = max(preds["subcategory_predictions"], key=preds["subcategory_predictions"].get)
-    predicted_sub_labels_indices.append(sub_label_binarizer.classes_.tolist().index(predicted_class_name))
-
-predicted_sub_labels_indices = np.array(predicted_sub_labels_indices)
-
-all_present_sub_label_indices = np.unique(np.concatenate((true_sub_labels_indices, predicted_sub_labels_indices)))
-target_names_for_sub_report = [sub_label_binarizer.classes_[idx] for idx in all_present_sub_label_indices]
-
-cm_sub = confusion_matrix(true_sub_labels_indices, predicted_sub_labels_indices, labels=all_present_sub_label_indices)
-
-accuracy_sub = accuracy_score(true_sub_labels_indices, predicted_sub_labels_indices)
-precision_sub = precision_score(true_sub_labels_indices, predicted_sub_labels_indices, average='weighted', zero_division=0, labels=all_present_sub_label_indices)
-recall_sub = recall_score(true_sub_labels_indices, predicted_sub_labels_indices, average='weighted', zero_division=0, labels=all_present_sub_label_indices)
-f1_sub = f1_score(true_sub_labels_indices, predicted_sub_labels_indices, average='weighted', zero_division=0, labels=all_present_sub_label_indices)
-
-print("\n--- Subcategory Evaluation ---")
-print(f"Accuracy (Subcategory): {accuracy_sub:.4f}")
-print(f"Precision (Subcategory, weighted): {precision_sub:.4f}")
-print(f"Recall (Subcategory, weighted): {recall_sub:.4f}")
-print(f"F1-score (Subcategory, weighted): {f1_sub:.4f}")
-print("\nClassification Report (Subcategory):")
-print(classification_report(true_sub_labels_indices, predicted_sub_labels_indices,
-                             labels=all_present_sub_label_indices,
-                             target_names=target_names_for_sub_report,
-                             zero_division=0))
-
-plt.figure(figsize=(16, 14))
-sns.heatmap(cm_sub, annot=True, fmt='d', cmap='Blues',
-            xticklabels=target_names_for_sub_report,
-            yticklabels=target_names_for_sub_report)
-plt.xlabel('Predicted Sub Labels')
-plt.ylabel('True Sub Labels')
-plt.title('Confusion Matrix - Subcategories')
-plt.xticks(rotation=90, ha='right')
-plt.yticks(rotation=0)
-plt.tight_layout()
-plt.show()
-sample_text = "I fight bears"
-# --- Example Prediction and Visualization ---
-
-prediction_results = predict(sample_text)
-print(f"Text: '{sample_text}'")
-
-print("\nMain Category Predictions:")
-for category, percentage in prediction_results["main_category_predictions"].items():
-    print(f"- {category}: {percentage:.2f}%")
-
-print("\nSubcategory Predictions:")
-for category, percentage in prediction_results["subcategory_predictions"].items():
-    print(f"- {category}: {percentage:.2f}%")
-
-# Plotting the main category prediction results for the sample text.
-main_categories_for_plot = list(prediction_results["main_category_predictions"].keys())
-main_percentages_for_plot = list(prediction_results["main_category_predictions"].values())
-
-plt.figure(figsize=(10, 6)) # Adjusted figure size
-plt.bar(main_categories_for_plot, main_percentages_for_plot, color='skyblue')
-plt.xlabel("Main Categories")
-plt.ylabel("Probability (%)")
-#plt.title(f"Predicted Main Category Probabilities for:\n'{sample_text}'")
-plt.xticks(rotation=45, ha="right") # Rotate x-axis labels for better visibility
-plt.tight_layout() # Adjust layout to prevent labels from overlapping
-for i, percentage in enumerate(main_percentages_for_plot):
-    plt.text(i, percentage + 0.5, f"{percentage:.2f}%", ha="center", va="bottom", fontsize=8)
-plt.show()
-
-# Plotting the subcategory prediction results for the sample text.
-sub_categories_for_plot = list(prediction_results["subcategory_predictions"].keys())
-sub_percentages_for_plot = list(prediction_results["subcategory_predictions"].values())
-
-plt.figure(figsize=(12, 8)) # Adjusted figure size
-plt.bar(sub_categories_for_plot, sub_percentages_for_plot, color='lightcoral')
-plt.xlabel("Subcategories")
-plt.ylabel("Probability (%)")
-#plt.title(f"Predicted Subcategory Probabilities for:\n'{sample_text}'")
-plt.xticks(rotation=90, ha="right") # Rotate x-axis labels for better visibility
-plt.tight_layout() # Adjust layout to prevent labels from overlapping
-for i, percentage in enumerate(sub_percentages_for_plot):
-    plt.text(i, percentage + 0.5, f"{percentage:.2f}%", ha="center", va="bottom", fontsize=8)
-plt.show()
+sample = "Passenger complained about missing vegan meal and no water was loaded"
+print(f"\nPrediction for: '{sample}'")
+res = predict_single(sample)
+for k, v in list(res.items())[:5]:
+    print(f"- {k}: {v:.2f}%")
