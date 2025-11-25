@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
 import tensorflow_hub as hub
-import tensorflow_text as text  # Required for BERT ops
+import tensorflow_text as text
 import json
 import numpy as np
 from typing import List, Dict
@@ -15,14 +15,14 @@ import os
 import psycopg2
 import datetime
 import re
-import gdown  # Required for downloading the model from Drive
+import gdown  # Required for downloading the model
 
 app = FastAPI(title="FCR Feedback Categorization API")
 
 # --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for now (adjust for production)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +35,7 @@ sub_classes = None
 # --- Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- Constants & Preprocessing Logic (Must Match Training Code) ---
+# --- Constants & Preprocessing Logic ---
 BEVERAGE_WORDS = ["water", "beverage", "drink", "juice", "soda", "coffee", "tea", "bottle", "bottles"]
 SERVICE_ITEM_WORDS = [
     "utensil", "fork", "knife", "spoon", "napkin",
@@ -71,7 +71,7 @@ def keyword_features_from_text(t: str) -> List[float]:
     has_crew = int(any(w in t for w in CREW_WORDS))
     return [float(has_beverage), float(has_service_item), float(has_catering), float(has_crew)]
 
-# --- Model Download Logic ---
+# --- Robust Model Download Logic ---
 def download_model_if_missing(model_path):
     """Downloads model from Google Drive if not found locally."""
     if not os.path.exists(model_path):
@@ -79,12 +79,18 @@ def download_model_if_missing(model_path):
         
         # FILE ID from your specific Google Drive link
         file_id = "1cw0XieJsrexcv3aPnjQDRccpoXdvhiCj"
-        url = f'https://drive.google.com/uc?id={file_id}'
         
         try:
-            # gdown handles large files and virus warnings automatically
-            gdown.download(url, model_path, quiet=False)
-            print("✅ Download complete.")
+            # Use ID directly for better reliability
+            gdown.download(id=file_id, output=model_path, quiet=False)
+            
+            # CHECK: If file is too small (<100KB), it's likely an HTML error page
+            if os.path.exists(model_path) and os.path.getsize(model_path) < 100000:
+                print("❌ Error: Downloaded file is too small (likely an error page). Deleting...")
+                os.remove(model_path)
+            else:
+                print("✅ Download complete.")
+                
         except Exception as e:
             print(f"❌ Failed to download model: {e}")
 
@@ -97,7 +103,6 @@ def init_db():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        # Create table if it doesn't exist
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id SERIAL PRIMARY KEY,
@@ -138,22 +143,23 @@ class BulkPredictionResponse(BaseModel):
 async def load_model_and_classes():
     global model, sub_classes
     
+    # 1. Initialize Database
     init_db()
     
-    # 1. Download Model if Missing
+    # 2. Download Model if Missing
     model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
     download_model_if_missing(model_path)
     
     try:
-        # 2. Load Model
-        # We must map 'KerasLayer' to the hub.KerasLayer class for loading
+        # 3. Load Model
+        # Map 'KerasLayer' to hub.KerasLayer for loading
         model = tf.keras.models.load_model(
             model_path,
             custom_objects={'KerasLayer': hub.KerasLayer}
         )
         print(f"✅ Model loaded from {model_path}")
         
-        # 3. Load Classes
+        # 4. Load Classes
         sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
         with open(sub_classes_path, 'r') as f:
             sub_classes = json.load(f)
@@ -161,9 +167,10 @@ async def load_model_and_classes():
         
     except Exception as e:
         print(f"❌ Error loading model or classes: {e}")
-        # Debugging: Print file size if it exists to check for corruption
+        # Debug: Print file size to help diagnose corruption
         if os.path.exists(model_path):
-            print(f"DEBUG: File size of {model_path} is {os.path.getsize(model_path)} bytes")
+            size_mb = os.path.getsize(model_path) / (1024 * 1024)
+            print(f"DEBUG: File size is {size_mb:.2f} MB")
         model = None
         sub_classes = []
 
@@ -173,28 +180,26 @@ def predict_text(text_input: str) -> Dict:
         raise HTTPException(status_code=503, detail="Model is not loaded")
 
     try:
-        # 1. Preprocess
         cleaned_text = clean_text(text_input)
         kw_feats = keyword_features_from_text(cleaned_text)
         
-        # 2. Prepare Inputs (Batch dim added)
+        # Prepare Inputs
         input_text_tensor = np.array([cleaned_text])
         input_kw_tensor = np.array([kw_feats])
         
-        # 3. Predict (Dual Input)
+        # Predict
         predictions = model.predict([input_text_tensor, input_kw_tensor], verbose=0)
         
-        # 4. Format Results
+        # Format Results
         probs = predictions[0] * 100 
         sub_predictions = []
         for i, prob in enumerate(probs):
             if i < len(sub_classes):
                 sub_predictions.append({"label": sub_classes[i], "probability": float(prob)})
         
-        # Sort descending
         sub_sorted = sorted(sub_predictions, key=lambda x: x['probability'], reverse=True)
         
-        # 5. Database Logging
+        # Database Logging
         if DATABASE_URL:
             try:
                 top_sub = sub_sorted[0]
@@ -212,7 +217,7 @@ def predict_text(text_input: str) -> Dict:
                     (
                         datetime.datetime.now(datetime.timezone.utc),
                         text_input,
-                        "N/A",      # Main category placeholder
+                        "N/A",
                         0.0,
                         top_sub["label"],
                         top_sub["probability"]
@@ -263,7 +268,6 @@ async def predict_bulk(request: BulkPredictionRequest):
     results = []
     for t in request.texts:
         if not t or not t.strip():
-            # Return empty prediction for empty string
             results.append({"subPredictions": []})
         else:
             try:
@@ -275,5 +279,4 @@ async def predict_bulk(request: BulkPredictionRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Local debugging
     uvicorn.run(app, host="0.0.0.0", port=8000)
