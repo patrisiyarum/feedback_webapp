@@ -1,5 +1,6 @@
 """
 FastAPI Backend for FCR Feedback Categorization Model (Subcategory Only)
+NO DATABASE VERSION
 """
 
 from fastapi import FastAPI, HTTPException
@@ -7,13 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
 import tensorflow_hub as hub
-import tensorflow_text as text
+import tensorflow_text as text  # Required for BERT ops
 import json
 import numpy as np
 from typing import List, Dict
 import os
-import psycopg2
-import datetime
 import re
 import gdown  # Required for downloading the model
 
@@ -31,9 +30,6 @@ app.add_middleware(
 # --- Global Variables ---
 model = None
 sub_classes = None
-
-# --- Configuration ---
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- Constants & Preprocessing Logic ---
 BEVERAGE_WORDS = ["water", "beverage", "drink", "juice", "soda", "coffee", "tea", "bottle", "bottles"]
@@ -81,45 +77,15 @@ def download_model_if_missing(model_path):
         file_id = "1cw0XieJsrexcv3aPnjQDRccpoXdvhiCj"
         
         try:
-            # Use ID directly for better reliability
             gdown.download(id=file_id, output=model_path, quiet=False)
             
-            # CHECK: If file is too small (<100KB), it's likely an HTML error page
             if os.path.exists(model_path) and os.path.getsize(model_path) < 100000:
                 print("❌ Error: Downloaded file is too small (likely an error page). Deleting...")
                 os.remove(model_path)
             else:
                 print("✅ Download complete.")
-                
         except Exception as e:
             print(f"❌ Failed to download model: {e}")
-
-# --- Database Setup ---
-def init_db():
-    if not DATABASE_URL:
-        print("❌ DATABASE_URL not set. Logging disabled.")
-        return
-
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cursor = conn.cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id SERIAL PRIMARY KEY,
-            timestamp TIMESTAMPTZ NOT NULL,
-            input_text TEXT,
-            predicted_main_category VARCHAR(255),
-            main_confidence REAL,
-            predicted_sub_category VARCHAR(255),
-            sub_confidence REAL
-        )
-        """)
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print("✅ Database table initialized.")
-    except Exception as e:
-        print(f"❌ Failed to initialize database: {e}")
 
 # --- Pydantic Models ---
 class PredictionRequest(BaseModel):
@@ -143,23 +109,19 @@ class BulkPredictionResponse(BaseModel):
 async def load_model_and_classes():
     global model, sub_classes
     
-    # 1. Initialize Database
-    init_db()
-    
-    # 2. Download Model if Missing
+    # 1. Download Model if Missing
     model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
     download_model_if_missing(model_path)
     
     try:
-        # 3. Load Model
-        # Map 'KerasLayer' to hub.KerasLayer for loading
+        # 2. Load Model
         model = tf.keras.models.load_model(
             model_path,
             custom_objects={'KerasLayer': hub.KerasLayer}
         )
         print(f"✅ Model loaded from {model_path}")
         
-        # 4. Load Classes
+        # 3. Load Classes
         sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
         with open(sub_classes_path, 'r') as f:
             sub_classes = json.load(f)
@@ -167,7 +129,6 @@ async def load_model_and_classes():
         
     except Exception as e:
         print(f"❌ Error loading model or classes: {e}")
-        # Debug: Print file size to help diagnose corruption
         if os.path.exists(model_path):
             size_mb = os.path.getsize(model_path) / (1024 * 1024)
             print(f"DEBUG: File size is {size_mb:.2f} MB")
@@ -199,35 +160,7 @@ def predict_text(text_input: str) -> Dict:
         
         sub_sorted = sorted(sub_predictions, key=lambda x: x['probability'], reverse=True)
         
-        # Database Logging
-        if DATABASE_URL:
-            try:
-                top_sub = sub_sorted[0]
-                conn = psycopg2.connect(DATABASE_URL)
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO predictions (
-                        timestamp, input_text, 
-                        predicted_main_category, main_confidence, 
-                        predicted_sub_category, sub_confidence
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        datetime.datetime.now(datetime.timezone.utc),
-                        text_input,
-                        "N/A",
-                        0.0,
-                        top_sub["label"],
-                        top_sub["probability"]
-                    )
-                )
-                conn.commit()
-                cursor.close()
-                conn.close()
-            except Exception as e:
-                print(f"DB Log Error: {e}")
+        # Note: Database Logging removed
         
         return {"subPredictions": sub_sorted}
 
@@ -239,7 +172,7 @@ def predict_text(text_input: str) -> Dict:
 
 @app.get("/")
 async def root():
-    return {"status": "online", "model": "Subcategory Classification Augmented (8 Labels)"}
+    return {"status": "online", "model": "Subcategory Classification Augmented (8 Labels) - No DB"}
 
 @app.get("/health")
 async def health():
