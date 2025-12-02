@@ -1,6 +1,6 @@
 """
 FastAPI Backend for FCR Feedback Categorization Model (Subcategory Only)
-NO DATABASE VERSION
+Git LFS Version (Local Model)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -14,7 +14,6 @@ import numpy as np
 from typing import List, Dict
 import os
 import re
-import gdown  # Required for downloading the model
 
 app = FastAPI(title="FCR Feedback Categorization API")
 
@@ -67,26 +66,6 @@ def keyword_features_from_text(t: str) -> List[float]:
     has_crew = int(any(w in t for w in CREW_WORDS))
     return [float(has_beverage), float(has_service_item), float(has_catering), float(has_crew)]
 
-# --- Robust Model Download Logic ---
-def download_model_if_missing(model_path):
-    """Downloads model from Google Drive if not found locally."""
-    if not os.path.exists(model_path):
-        print(f"⚠️ Model file not found at {model_path}. Downloading from Drive...")
-        
-        # FILE ID from your specific Google Drive link
-        file_id = "1cw0XieJsrexcv3aPnjQDRccpoXdvhiCj"
-        
-        try:
-            gdown.download(id=file_id, output=model_path, quiet=False)
-            
-            if os.path.exists(model_path) and os.path.getsize(model_path) < 100000:
-                print("❌ Error: Downloaded file is too small (likely an error page). Deleting...")
-                os.remove(model_path)
-            else:
-                print("✅ Download complete.")
-        except Exception as e:
-            print(f"❌ Failed to download model: {e}")
-
 # --- Pydantic Models ---
 class PredictionRequest(BaseModel):
     text: str
@@ -109,29 +88,33 @@ class BulkPredictionResponse(BaseModel):
 async def load_model_and_classes():
     global model, sub_classes
     
-    # 1. Download Model if Missing
+    # Define paths (Assumes files are in the same directory as main.py)
     model_path = os.getenv("MODEL_PATH", "subcategory_model_augmented.keras")
-    download_model_if_missing(model_path)
+    classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
     
     try:
+        # 1. Load Classes
+        with open(classes_path, 'r') as f:
+            sub_classes = json.load(f)
+        print(f"✅ Loaded {len(sub_classes)} subcategories from {classes_path}")
+
         # 2. Load Model
+        # We must map 'KerasLayer' to the hub.KerasLayer class
         model = tf.keras.models.load_model(
             model_path,
             custom_objects={'KerasLayer': hub.KerasLayer}
         )
         print(f"✅ Model loaded from {model_path}")
         
-        # 3. Load Classes
-        sub_classes_path = os.getenv("SUB_CLASSES_PATH", "subcategory_classes.json")
-        with open(sub_classes_path, 'r') as f:
-            sub_classes = json.load(f)
-        print(f"✅ Loaded {len(sub_classes)} subcategories")
-        
     except Exception as e:
         print(f"❌ Error loading model or classes: {e}")
+        # Debug info
         if os.path.exists(model_path):
             size_mb = os.path.getsize(model_path) / (1024 * 1024)
-            print(f"DEBUG: File size is {size_mb:.2f} MB")
+            print(f"DEBUG: Found model file. Size: {size_mb:.2f} MB")
+        else:
+            print(f"DEBUG: Model file NOT found at {model_path}")
+            
         model = None
         sub_classes = []
 
@@ -160,8 +143,6 @@ def predict_text(text_input: str) -> Dict:
         
         sub_sorted = sorted(sub_predictions, key=lambda x: x['probability'], reverse=True)
         
-        # Note: Database Logging removed
-        
         return {"subPredictions": sub_sorted}
 
     except Exception as e:
@@ -172,7 +153,7 @@ def predict_text(text_input: str) -> Dict:
 
 @app.get("/")
 async def root():
-    return {"status": "online", "model": "Subcategory Classification Augmented (8 Labels) - No DB"}
+    return {"status": "online", "model": "Subcategory Classification (Local LFS)"}
 
 @app.get("/health")
 async def health():
