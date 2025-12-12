@@ -203,10 +203,6 @@ The model uses two types of inputs:
 
 These features help improve classification accuracy by providing domain-specific context to the BERT model.
 
-## License
-
-[Specify your license here]
-
 ## Support
 
 For issues or questions, please contact [your contact information].
