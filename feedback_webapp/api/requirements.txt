@@ -1,11 +1,10 @@
+# FastAPI and Server
 uvicorn
 fastapi
-# PINNED VERSIONS (Do not change these)
+pydantic
+
+# TensorFlow and ML Dependencies (PINNED VERSIONS - Do not change)
 tensorflow==2.15.1
 tensorflow-text==2.15.0
 tensorflow-hub==0.16.1
 numpy<2.0.0
-pandas>=2.0.0
-streamlit>=1.28.0
-plotly>=5.0.0
-requests
