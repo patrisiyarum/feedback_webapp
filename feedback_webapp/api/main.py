@@ -10,7 +10,6 @@ from pydantic import BaseModel
 import tensorflow as tf
 import tensorflow_hub as hub
 import tensorflow_text  # Required for BERT ops
-from keras.layers import TFSMLayer
 import json
 import base64
 import numpy as np
@@ -117,7 +116,7 @@ async def load_model_and_classes():
         main_classes_path = os.getenv("MAIN_CLASSES_PATH", "../main_category_classes.json")
         sub_classes_path = os.getenv("SUB_CLASSES_PATH", "../subcategory_classes.json")
         # Load model
-        model = TFSMLayer(model_path, call_endpoint="serving_default")
+        model = tf.saved_model.load(model_path)
         print(f"✅ Model loaded successfully from {model_path}")
         
         # Load class labels
@@ -145,8 +144,9 @@ def predict_text(text: str) -> Dict:
         # Convert to tensor
         inputs = tf.constant([text])
         
-        # Get predictions
-        outputs = model(inputs)
+        # Get predictions via the serving signature
+        serve_fn = model.signatures["serving_default"]
+        outputs = serve_fn(inputs)
         
         # Extract probabilities
         main_probs = outputs["main_category_output"][0].numpy() * 100
