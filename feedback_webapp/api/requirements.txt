@@ -3,6 +3,9 @@ uvicorn
 fastapi
 pydantic
 
+# Database
+psycopg2-binary
+
 # TensorFlow and ML Dependencies (PINNED VERSIONS - Do not change)
 tensorflow==2.15.1
 tensorflow-text==2.15.0
